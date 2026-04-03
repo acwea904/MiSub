@@ -10,6 +10,11 @@ import { KV_KEY_SETTINGS, DEFAULT_SETTINGS } from '../config.js';
 
 const REPORTS_MAX_KEEP = 5000;
 const ALERTS_MAX_KEEP = 1000;
+const PUBLIC_SNAPSHOT_CACHE_KEY = 'misub_vps_public_snapshot';
+const PUBLIC_NODE_DETAIL_CACHE_KEY_PREFIX = 'misub_vps_public_node_detail:';
+const PUBLIC_CACHE_TTL_SECONDS = 60;
+const REPORT_PRUNE_CACHE_KEY = 'misub_vps_prune_last_ms';
+const REPORT_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 
 async function getStorageAdapter(env) {
     return StorageFactory.createAdapter(env, STORAGE_TYPES.D1);
@@ -36,6 +41,76 @@ function ensureD1StorageMode(settings, env) {
 
 function getD1(env) {
     return env.MISUB_DB;
+}
+
+function getKv(env) {
+    return StorageFactory.resolveKV(env);
+}
+
+async function readJsonCache(env, key) {
+    const kv = getKv(env);
+    if (!kv) return null;
+    try {
+        const raw = await kv.get(key);
+        if (!raw) return null;
+        return JSON.parse(raw);
+    } catch (error) {
+        console.warn('[VPS Monitor] KV cache read failed:', error?.message || error);
+        return null;
+    }
+}
+
+async function writeJsonCache(env, key, value, ttl = PUBLIC_CACHE_TTL_SECONDS) {
+    const kv = getKv(env);
+    if (!kv) return false;
+    try {
+        await kv.put(key, JSON.stringify(value), { expirationTtl: ttl });
+        return true;
+    } catch (error) {
+        console.warn('[VPS Monitor] KV cache write failed:', error?.message || error);
+        return false;
+    }
+}
+
+async function deleteJsonCache(env, key) {
+    const kv = getKv(env);
+    if (!kv) return false;
+    try {
+        await kv.delete(key);
+        return true;
+    } catch (error) {
+        console.warn('[VPS Monitor] KV cache delete failed:', error?.message || error);
+        return false;
+    }
+}
+
+async function invalidatePublicCaches(env, nodeId = null) {
+    await deleteJsonCache(env, PUBLIC_SNAPSHOT_CACHE_KEY);
+    if (nodeId) {
+        await deleteJsonCache(env, PUBLIC_NODE_DETAIL_CACHE_KEY_PREFIX + nodeId);
+    }
+}
+
+async function maybePruneReports(db, settings, env) {
+    const kv = getKv(env);
+    if (!kv) return;
+
+    try {
+        const lastPruneStr = await kv.get(REPORT_PRUNE_CACHE_KEY);
+        const lastPruneMs = lastPruneStr ? Number(lastPruneStr) : 0;
+        if (Number.isFinite(lastPruneMs) && (Date.now() - lastPruneMs) < REPORT_PRUNE_INTERVAL_MS) {
+            return;
+        }
+    } catch (error) {
+        console.warn('[VPS Monitor] report prune cache unavailable, skipping interval check');
+    }
+
+    try {
+        await pruneAllReportsAndSamples(db, settings);
+        await kv.put(REPORT_PRUNE_CACHE_KEY, String(Date.now()), { expirationTtl: Math.ceil(REPORT_PRUNE_INTERVAL_MS / 1000) });
+    } catch (error) {
+        console.warn('[VPS Monitor] report prune failed:', error?.message || error);
+    }
 }
 
 function nowIso() {
@@ -489,8 +564,25 @@ async function updateNodeStatus(db, settings, node, report) {
 /**
  * Global heartbeat check for all nodes.
  * Used for "ride-along" detection when any node reports.
+ * Uses KV cache to avoid scanning on every report.
  */
-async function checkAllNodesHeartbeat(db, settings) {
+async function checkAllNodesHeartbeat(db, settings, env) {
+    const lastCheckKey = 'vps_heartbeat_last_check_ms';
+    const minIntervalMs = 60_000; // 至少 1 分钟检查一次
+
+    try {
+        const kv = env.MISUB_KV;
+        if (kv) {
+            const lastCheckStr = await kv.get(lastCheckKey);
+            const lastCheck = lastCheckStr ? parseInt(lastCheckStr, 10) : 0;
+            if (Number.isFinite(lastCheck) && (Date.now() - lastCheck) < minIntervalMs) {
+                return;
+            }
+        }
+    } catch (e) {
+        console.warn('[VPS Monitor] KV heartbeat cache unavailable, falling through');
+    }
+
     const threshold = clampNumber(settings?.vpsMonitor?.offlineThresholdMinutes, 1, 1440, 10);
     const cutoff = new Date(Date.now() - threshold * 60 * 1000).toISOString();
 
@@ -500,7 +592,14 @@ async function checkAllNodesHeartbeat(db, settings) {
     ).bind(cutoff).all();
 
     const staleNodes = staleNodesResult?.results || [];
-    if (!staleNodes.length) return;
+    if (!staleNodes.length) {
+        // Cache the check even when no stale nodes
+        try {
+            const kv = env.MISUB_KV;
+            if (kv) await kv.put(lastCheckKey, String(Date.now()), { expirationTtl: 300 });
+        } catch (e) { /* ignore */ }
+        return;
+    }
 
     console.info(`[VPS Monitor] Detected ${staleNodes.length} stale nodes. Updating to offline.`);
 
@@ -526,6 +625,12 @@ async function checkAllNodesHeartbeat(db, settings) {
         }
         await updateNode(db, node);
     }
+
+    // Cache the check timestamp
+    try {
+        const kv = env.MISUB_KV;
+        if (kv) await kv.put(lastCheckKey, String(Date.now()), { expirationTtl: 300 });
+    } catch (e) { /* ignore */ }
 }
 
 function getReportRetentionCutoff(settings) {
@@ -673,6 +778,35 @@ async function updateNode(db, node) {
     }
 }
 
+async function updateNodeIncremental(db, nodeId, fields) {
+    const setClauses = [];
+    const bindings = [];
+    for (const [col, value] of Object.entries(fields)) {
+        setClauses.push(`${col} = ?`);
+        bindings.push(value);
+    }
+    if (!setClauses.length) return;
+    bindings.push(nodeId);
+    try {
+        await db.prepare(`UPDATE vps_nodes SET ${setClauses.join(', ')} WHERE id = ?`).bind(...bindings).run();
+    } catch (error) {
+        const message = error?.message || '';
+        if (!message.includes('no column named overload_state_json') && !message.includes('no column named use_global_targets') && !message.includes('no column named country_code')) {
+            throw error;
+        }
+        // Fallback: try without newer columns
+        const fallbackFields = {};
+        for (const [col, value] of Object.entries(fields)) {
+            if (!['overload_state_json', 'use_global_targets', 'country_code'].includes(col)) {
+                fallbackFields[col] = value;
+            }
+        }
+        if (Object.keys(fallbackFields).length) {
+            await updateNodeIncremental(db, nodeId, fallbackFields);
+        }
+    }
+}
+
 async function deleteNode(db, nodeId) {
     await db.prepare('DELETE FROM vps_nodes WHERE id = ?').bind(nodeId).run();
     await db.prepare('DELETE FROM vps_reports WHERE node_id = ?').bind(nodeId).run();
@@ -690,20 +824,26 @@ async function pruneReports(db, settings) {
     await db.prepare('DELETE FROM vps_reports WHERE reported_at < ?').bind(cutoff).run();
 }
 
+async function pruneAlerts(db) {
+    await db.prepare(
+        'DELETE FROM vps_alerts WHERE id NOT IN (SELECT id FROM vps_alerts ORDER BY created_at DESC LIMIT ?)'
+    ).bind(ALERTS_MAX_KEEP).run();
+}
+
 async function fetchReportsForNode(db, nodeId, settings) {
     const cutoff = new Date(getReportRetentionCutoff(settings)).toISOString();
     const result = await db.prepare(
-        'SELECT data FROM vps_reports WHERE node_id = ? AND reported_at >= ? ORDER BY reported_at ASC LIMIT ?'
+        'SELECT data FROM vps_reports WHERE node_id = ? AND reported_at >= ? ORDER BY reported_at DESC LIMIT ?'
     ).bind(nodeId, cutoff, REPORTS_MAX_KEEP).all();
-    return (result.results || []).map(row => JSON.parse(row.data));
+    return (result.results || []).map(row => JSON.parse(row.data)).reverse();
 }
 
 async function fetchNetworkSamples(db, nodeId, settings) {
     const cutoff = new Date(getReportRetentionCutoff(settings)).toISOString();
     const result = await db.prepare(
-        'SELECT data FROM vps_network_samples WHERE node_id = ? AND reported_at >= ? ORDER BY reported_at ASC LIMIT ?'
+        'SELECT data FROM vps_network_samples WHERE node_id = ? AND reported_at >= ? ORDER BY reported_at DESC LIMIT ?'
     ).bind(nodeId, cutoff, REPORTS_MAX_KEEP).all();
-    return (result.results || []).map(row => JSON.parse(row.data));
+    return (result.results || []).map(row => JSON.parse(row.data)).reverse();
 }
 
 async function insertNetworkSample(db, sample) {
@@ -715,6 +855,15 @@ async function insertNetworkSample(db, sample) {
 async function pruneNetworkSamples(db, settings) {
     const cutoff = new Date(getReportRetentionCutoff(settings)).toISOString();
     await db.prepare('DELETE FROM vps_network_samples WHERE reported_at < ?').bind(cutoff).run();
+}
+
+async function pruneAllReportsAndSamples(db, settings) {
+    const cutoff = new Date(getReportRetentionCutoff(settings)).toISOString();
+    await db.batch([
+        db.prepare('DELETE FROM vps_reports WHERE reported_at < ?').bind(cutoff),
+        db.prepare('DELETE FROM vps_network_samples WHERE reported_at < ?').bind(cutoff),
+    ]);
+    await pruneAlerts(db);
 }
 
 async function fetchNetworkTargets(db, nodeId) {
@@ -1429,6 +1578,8 @@ export async function handleVpsReport(request, env) {
         network: sanitizedChecks.length ? sanitizedChecks : null
     };
 
+    // Batch insert network sample + report if applicable
+    const batchStatements = [];
     if (sanitizedChecks.length) {
         const networkSample = {
             id: crypto.randomUUID(),
@@ -1437,27 +1588,49 @@ export async function handleVpsReport(request, env) {
             createdAt: nowIso(),
             checks: sanitizedChecks
         };
-        await insertNetworkSample(db, networkSample);
-        await pruneNetworkSamples(db, settings);
+        batchStatements.push(
+            db.prepare(
+                'INSERT INTO vps_network_samples (id, node_id, reported_at, created_at, data) VALUES (?, ?, ?, ?, ?)'
+            ).bind(networkSample.id, networkSample.nodeId, networkSample.reportedAt, networkSample.createdAt, JSON.stringify(networkSample))
+        );
     }
 
     const reportInterval = clampNumber(settings?.vpsMonitor?.reportStoreIntervalMinutes, 1, 60, 1);
     const lastSeenTs = node.lastSeenAt ? new Date(node.lastSeenAt).getTime() : NaN;
     if (reportInterval <= 1 || !Number.isFinite(lastSeenTs) || (Date.now() - lastSeenTs) >= reportInterval * 60 * 1000) {
-        await insertReport(db, normalizedReport);
-        await pruneReports(db, settings);
+        batchStatements.push(
+            db.prepare(
+                'INSERT INTO vps_reports (id, node_id, reported_at, created_at, data) VALUES (?, ?, ?, ?, ?)'
+            ).bind(normalizedReport.id, normalizedReport.nodeId, normalizedReport.reportedAt, normalizedReport.createdAt, JSON.stringify(normalizedReport))
+        );
+    }
+
+    if (batchStatements.length > 0) {
+        await db.batch(batchStatements);
     }
 
     node.lastSeenAt = normalizedReport.reportedAt;
     await updateNodeStatus(db, settings, node, normalizedReport);
     
     // Carry-along check for other nodes
-    await checkAllNodesHeartbeat(db, settings);
+    await checkAllNodesHeartbeat(db, settings, env);
 
-    node.lastReport = buildSnapshot(normalizedReport, node);
-    node.updatedAt = nowIso();
-    await updateNode(db, node);
+    // Incremental update: only write changed fields instead of full row
+    const updatedAt = nowIso();
+    await updateNodeIncremental(db, node.id, {
+        status: node.status,
+        last_seen_at: node.lastSeenAt,
+        total_rx: node.totalRx || 0,
+        total_tx: node.totalTx || 0,
+        last_report_json: JSON.stringify(buildSnapshot(normalizedReport, node)),
+        overload_state_json: node.overloadState ? JSON.stringify(node.overloadState) : null,
+        updated_at: updatedAt
+    });
 
+    // In regular reports, we rely on the 60s TTL of the KV cache instead of manual invalidation.
+    // This drastically reduces KV write/delete operations to stay within free limits.
+    // Manual invalidation still occurs on node configuration changes.
+    await maybePruneReports(db, settings, env);
     return createJsonResponse({ success: true });
 }
 
@@ -1504,6 +1677,7 @@ export async function handleVpsNodesRequest(request, env) {
             overloadState: null
         };
         await insertNode(db, node);
+        await invalidatePublicCaches(env, node.id);
 
         return createJsonResponse({ success: true, data: node, guide: buildPublicGuide(env, request, node) });
     }
@@ -1535,6 +1709,11 @@ export async function handleVpsPublicSnapshotRequest(request, env) {
         headerEnabled: settings?.vpsMonitor?.publicPageShowHeader !== false,
         footerEnabled: settings?.vpsMonitor?.publicPageShowFooter !== false
     };
+
+    const cached = await readJsonCache(env, PUBLIC_SNAPSHOT_CACHE_KEY);
+    if (cached) {
+        return createJsonResponse(cached);
+    }
 
     const db = getD1(env);
     const nodes = await fetchNodes(db);
@@ -1589,31 +1768,37 @@ export async function handleVpsPublicSnapshotRequest(request, env) {
         return summary;
     });
 
-    return createJsonResponse({
+    const responseBody = {
         success: true,
         data,
         theme: buildPublicThemeConfig(settings),
         layout
-    });
+    };
+    await writeJsonCache(env, PUBLIC_SNAPSHOT_CACHE_KEY, responseBody);
+    return createJsonResponse(responseBody);
 }
 
 async function fetchLatestNetworkSamplesBatch(db, nodeIds) {
     if (!nodeIds.length) return [];
     const placeholders = nodeIds.map(() => '?').join(',');
-    const sql = `SELECT node_id, data, reported_at FROM vps_network_samples WHERE node_id IN (${placeholders}) ORDER BY reported_at DESC`;
+    const sql = `
+        SELECT samples.node_id, samples.data, samples.reported_at
+        FROM vps_network_samples AS samples
+        INNER JOIN (
+            SELECT node_id, MAX(reported_at) AS latest_reported_at
+            FROM vps_network_samples
+            WHERE node_id IN (${placeholders})
+            GROUP BY node_id
+        ) AS latest
+        ON samples.node_id = latest.node_id AND samples.reported_at = latest.latest_reported_at
+        ORDER BY samples.node_id
+    `;
     const { results } = await db.prepare(sql).bind(...nodeIds).all();
-    
-    const latestMap = new Map();
-    for (const row of results) {
-        if (!latestMap.has(row.node_id)) {
-            latestMap.set(row.node_id, {
-                nodeId: row.node_id,
-                checks: row.data ? JSON.parse(row.data).checks : [],
-                reportedAt: row.reported_at
-            });
-        }
-    }
-    return Array.from(latestMap.values());
+    return (results || []).map(row => ({
+        nodeId: row.node_id,
+        checks: row.data ? JSON.parse(row.data).checks : [],
+        reportedAt: row.reported_at
+    }));
 }
 
 export async function handleVpsPublicNodeDetailRequest(request, env) {
@@ -1644,6 +1829,11 @@ export async function handleVpsPublicNodeDetailRequest(request, env) {
         return createErrorResponse('Node id required', 400);
     }
 
+    const cached = await readJsonCache(env, PUBLIC_NODE_DETAIL_CACHE_KEY_PREFIX + nodeId);
+    if (cached) {
+        return createJsonResponse(cached);
+    }
+
     const db = getD1(env);
     const node = await fetchNode(db, nodeId);
     if (!node) {
@@ -1657,14 +1847,14 @@ export async function handleVpsPublicNodeDetailRequest(request, env) {
     // Fetch network samples - last 500 points for better precision
     const cutoff = new Date(getReportRetentionCutoff(settings)).toISOString();
     const result = await db.prepare(
-        'SELECT data FROM vps_network_samples WHERE node_id = ? AND reported_at >= ? ORDER BY reported_at ASC LIMIT 500'
+        'SELECT data FROM vps_network_samples WHERE node_id = ? AND reported_at >= ? ORDER BY reported_at DESC LIMIT 500'
     ).bind(nodeId, cutoff).all();
     
     const samples = (result.results || []).map(row => {
         const s = JSON.parse(row.data);
         if (s.checks) s.checks = rehydrateCheckNames(s.checks, targets);
         return s;
-    });
+    }).reverse();
 
     const summary = summarizeNode(node, node.lastReport || null, settings);
     // Security: Remove sensitive IP information
@@ -1673,7 +1863,7 @@ export async function handleVpsPublicNodeDetailRequest(request, env) {
         if (summary.latest.ip) delete summary.latest.ip;
     }
 
-    return createJsonResponse({
+    const responseBody = {
         success: true,
         data: summary,
         networkSamples: samples,
@@ -1681,7 +1871,9 @@ export async function handleVpsPublicNodeDetailRequest(request, env) {
             headerEnabled: settings?.vpsMonitor?.publicPageShowHeader !== false,
             footerEnabled: settings?.vpsMonitor?.publicPageShowFooter !== false
         }
-    });
+    };
+    await writeJsonCache(env, PUBLIC_NODE_DETAIL_CACHE_KEY_PREFIX + nodeId, responseBody);
+    return createJsonResponse(responseBody);
 }
 
 export async function handleVpsNodeDetailRequest(request, env) {
@@ -1756,11 +1948,13 @@ export async function handleVpsNodeDetailRequest(request, env) {
         }
         node.updatedAt = nowIso();
         await updateNode(db, node);
+        await invalidatePublicCaches(env, node.id);
         return createJsonResponse({ success: true, data: node, guide: buildPublicGuide(env, request, node) });
     }
 
     if (request.method === 'DELETE') {
         await deleteNode(db, nodeId);
+        await invalidatePublicCaches(env, nodeId);
         return createJsonResponse({ success: true, data: node });
     }
 
@@ -1833,6 +2027,7 @@ export async function handleVpsNetworkTargetsRequest(request, env) {
             return createErrorResponse(`目标数量超过上限（${limit}）`, 400);
         }
         const target = await insertNetworkTarget(db, nodeId, payload);
+        await invalidatePublicCaches(env, nodeId);
         return createJsonResponse({ success: true, data: target });
     }
 
@@ -1858,6 +2053,7 @@ export async function handleVpsNetworkTargetsRequest(request, env) {
         if (!updated) {
             return createErrorResponse('Target not found', 404);
         }
+        await invalidatePublicCaches(env);
         return createJsonResponse({ success: true, data: updated });
     }
 
@@ -1868,6 +2064,7 @@ export async function handleVpsNetworkTargetsRequest(request, env) {
             return createErrorResponse('Target id required', 400);
         }
         await deleteNetworkTarget(db, targetId);
+        await invalidatePublicCaches(env);
         return createJsonResponse({ success: true });
     }
 
@@ -1939,4 +2136,22 @@ export async function handleVpsNetworkCheck(request, env) {
     };
 
     return createJsonResponse({ success: true, data: target, message: 'Probe will run check on next report' });
+}
+
+export async function handleVpsCleanup(request, env) {
+    if (request.method !== 'POST') {
+        return createErrorResponse('Method Not Allowed', 405);
+    }
+    const d1Check = ensureD1Available(env);
+    if (d1Check) return d1Check;
+
+    const settings = await loadVpsSettings(env);
+    const storageModeCheck = ensureD1StorageMode(settings, env);
+    if (storageModeCheck) return storageModeCheck;
+
+    const db = getD1(env);
+    await pruneAllReportsAndSamples(db, settings);
+    await invalidatePublicCaches(env);
+
+    return createJsonResponse({ success: true, message: 'Cleanup completed' });
 }
