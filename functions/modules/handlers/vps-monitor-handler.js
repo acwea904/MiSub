@@ -72,18 +72,31 @@ async function writeJsonCache(env, key, value, ttl = PUBLIC_CACHE_TTL_SECONDS) {
     }
 }
 
+/**
+ * Soft delete by overwriting with a very short TTL.
+ * This effectively invalidates the cache without consuming the KV "Delete" quota, 
+ * which is strictly limited to 1,000/day on the free tier.
+ */
 async function deleteJsonCache(env, key) {
     const kv = getKv(env);
     if (!kv) return false;
     try {
-        await kv.delete(key);
+        // Use put with 60s TTL (minimum allowed by KV for expirationTtl is 60s, 
+        // but it effectively hides the data immediately as we'll write an empty string).
+        // Actually, let's just use put with an empty value.
+        await kv.put(key, "", { expirationTtl: 60 }); 
         return true;
     } catch (error) {
-        console.warn('[VPS Monitor] KV cache delete failed:', error?.message || error);
+        console.warn('[VPS Monitor] KV cache "soft delete" failed:', error?.message || error);
         return false;
     }
 }
 
+/**
+ * Invalidate public caches.
+ * Note: Manual invalidation counts as a KV write now (instead of delete).
+ * In regular reports, we rely on automatic TTL expiration to save quota.
+ */
 async function invalidatePublicCaches(env, nodeId = null) {
     await deleteJsonCache(env, PUBLIC_SNAPSHOT_CACHE_KEY);
     if (nodeId) {
@@ -1106,7 +1119,7 @@ function buildInstallScript(reportUrl, node) {
         "MEM_USAGE=\"$(free | awk '/Mem/ {printf \"%.0f\", $3/$2*100}')\"",
         "DISK_USAGE=\"$(df -P / | awk 'NR==2 {gsub(/%/,\"\"); print $5}')\"",
         "LOAD1=\"$(awk '{print $1}' /proc/loadavg)\"",
-        "TRAFFIC_JSON=\"$(cat /proc/net/dev | awk 'NR>2 && $1 != \"lo:\" {rx += $2; tx += $10} END {printf \"{\\\"rx\\\": %d, \\\"tx\\\": %d}\", rx, tx}')\"",
+        "TRAFFIC_JSON=\"$(cat /proc/net/dev | awk 'NR>2 && $1 != \"lo:\" {rx += $2; tx += $10} END {printf \"{\\\"rx\\\": %.0f, \\\"tx\\\": %.0f}\", rx, tx}')\"",
         '',
         'REPORT_INTERVAL=60',
         'REPORT_STORE_INTERVAL=60',
