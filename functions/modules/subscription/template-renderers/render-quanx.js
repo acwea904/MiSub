@@ -24,21 +24,37 @@ function buildProxyLine(proxy) {
         return `trojan=${server}:${port}, password=${proxy.password || ''}${extras.length ? `, ${extras.join(', ')}` : ''}, tag=${name}`;
     }
     if (type === 'ss' || type === 'shadowsocks') {
-        return `shadowsocks=${server}:${port}, method=${proxy.cipher || 'aes-128-gcm'}, password=${proxy.password || ''}, tag=${name}`;
+        const extras = [];
+        const plugin = proxy.plugin || '';
+        const opts = proxy['plugin-opts'] || proxy.pluginOpts || {};
+        if (plugin === 'obfs-local' || proxy.obfs) {
+            extras.push(`obfs=${proxy.obfs || opts.mode}`);
+            if (proxy['obfs-host'] || opts.host) extras.push(`obfs-host=${proxy['obfs-host'] || opts.host}`);
+        } else if (plugin === 'v2ray-plugin' || opts.mode === 'websocket') {
+            extras.push('obfs=ws');
+            if (opts.path) extras.push(`obfs-uri=${opts.path}`);
+            if (opts.host) extras.push(`obfs-host=${opts.host}`);
+            if (opts.tls || opts.mode === 'websocket-tls') extras.push('over-tls=true');
+        }
+        if (proxy.udp) extras.push('udp-relay=true');
+        return `shadowsocks=${server}:${port}, method=${proxy.cipher || 'aes-128-gcm'}, password=${proxy.password || ''}${extras.length ? `, ${extras.join(', ')}` : ''}, tag=${name}`;
     }
     if (type === 'vmess') {
         const extras = [];
+        const sni = proxy.servername ?? proxy.sni;
+        const hasTlsLayer = proxy.tls || sni !== undefined;
         if (proxy.network === 'ws') {
-            extras.push('obfs=ws');
+            extras.push(hasTlsLayer ? 'obfs=wss' : 'obfs=ws');
             const wsOpts = proxy['ws-opts'] || proxy.wsOpts;
             if (wsOpts?.path) extras.push(`obfs-uri=${wsOpts.path}`);
             if (wsOpts?.headers?.Host) extras.push(`obfs-host=${wsOpts.headers.Host}`);
+            else if (sni !== undefined) extras.push(`obfs-host=${sni}`);
+        } else {
+            if (hasTlsLayer) extras.push('over-tls=true');
+            if (sni !== undefined) extras.push(`tls-host=${sni}`);
         }
-        const sni = proxy.servername ?? proxy.sni;
-        if (proxy.tls || sni !== undefined) extras.push('over-tls=true');
-        if (sni !== undefined) extras.push(`tls-host=${sni}`);
         if (proxy['skip-cert-verify'] === true || proxy.skipCertVerify === true) extras.push('tls-verification=false');
-        return `vmess=${server}:${port}, method=${proxy.cipher || 'auto'}, password=${proxy.uuid || ''}, tag=${name}${extras.length ? `, ${extras.join(', ')}` : ''}`;
+        return `vmess=${server}:${port}, method=${normalizeQxVmessMethod(proxy.cipher)}, password=${proxy.uuid || ''}${extras.length ? `, ${extras.join(', ')}` : ''}, tag=${name}`;
     }
     if (type === 'vless') {
         const extras = [];
@@ -63,11 +79,9 @@ function buildProxyLine(proxy) {
         return `http=${server}:${port}, username=${proxy.username || ''}, password=${proxy.password || ''}${extras.length ? `, ${extras.join(', ')}` : ''}, tag=${name}`;
     }
     if (type === 'hysteria2' || type === 'hy2') {
-        const extras = [];
-        const sni = proxy.servername ?? proxy.sni;
-        if (sni !== undefined) extras.push(`sni=${sni}`);
-        if (proxy['skip-cert-verify'] === true || proxy.skipCertVerify === true) extras.push('tls-verification=false');
-        return `hysteria2=${server}:${port}, password=${proxy.password || ''}${extras.length ? `, ${extras.join(', ')}` : ''}, tag=${name}`;
+        // Quantumult X rejects the Hysteria2 server syntax emitted by MiSub; omit it
+        // from rendered QuanX templates rather than breaking the entire import.
+        return null;
     }
     if (type === 'tuic') {
         const extras = [];
@@ -129,6 +143,12 @@ function buildRuleLine(rule) {
     return `${type},${rule.value},${rule.policy}`;
 }
 
+function normalizeQxVmessMethod(method) {
+    const normalized = String(method || '').trim().toLowerCase();
+    if (!normalized || normalized === 'auto') return 'none';
+    return normalized;
+}
+
 export function renderQuanxFromTemplateModel(model, options = {}) {
     const normalizedModel = normalizeUnifiedTemplateModel(model);
     const nodeList = typeof options.nodeList === 'string' ? options.nodeList : '';
@@ -142,7 +162,7 @@ export function renderQuanxFromTemplateModel(model, options = {}) {
 
     // Extraction of remote rules for Quantumult X
     const remoteRules = normalizedModel.rules.filter(r => String(r.type).toUpperCase() === 'RULE-SET' && r.value.startsWith('http'));
-    const filterRemoteLines = remoteRules.map(r => `${r.value}, tag=${r.policy}, policy=${r.policy}, enabled=true`);
+    const filterRemoteLines = remoteRules.map(r => `filter_remote, ${r.value}, tag=${r.policy}, force-policy=${r.policy}, update-interval=86400, enabled=true`);
     const localRules = normalizedModel.rules.filter(r => !remoteRules.includes(r));
 
     return [

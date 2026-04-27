@@ -34,7 +34,7 @@ function buildTemplateProxyBlock(nodeList) {
         .join('\n');
 }
 
-function extractProxySectionFromBuiltin(content, targetFormat) {
+export function extractProxySectionFromBuiltin(content, targetFormat) {
     if (typeof content !== 'string' || content.trim() === '') return '';
 
     if (targetFormat === 'clash') {
@@ -42,8 +42,18 @@ function extractProxySectionFromBuiltin(content, targetFormat) {
         return match ? match[1].trim() : '';
     }
 
-    if (targetFormat.startsWith('surge') || targetFormat === 'loon' || targetFormat === 'quanx') {
+    if (targetFormat.startsWith('surge') || targetFormat === 'loon') {
         const match = content.match(/\[Proxy\]\s*\n([\s\S]*?)(?:\n\n\[|$)/i);
+        if (!match) return '';
+        return match[1]
+            .split('\n')
+            .map(line => line.trim())
+            .filter(line => line && !/^DIRECT\s*=\s*direct$/i.test(line))
+            .join('\n');
+    }
+
+    if (targetFormat === 'quanx') {
+        const match = content.match(/\[server_local\]\s*\n([\s\S]*?)(?:\n\n\[|$)/i);
         if (!match) return '';
         return match[1]
             .split('\n')
@@ -96,6 +106,11 @@ export function resolveTemplateSource(value) {
         return { kind: 'builtin', value: normalizedValue.slice('builtin:'.length) };
     }
     return { kind: 'remote', value: normalizedValue };
+}
+
+export function resolveExternalTemplateConfigUrl(templateSource) {
+    if (!templateSource || typeof templateSource !== 'object') return '';
+    return templateSource.kind === 'remote' ? String(templateSource.value || '').trim() : '';
 }
 
 /**
@@ -295,9 +310,8 @@ export async function handleMisubRequest(context) {
     
     const builtinParam = (url.searchParams.get('builtin') || '').toLowerCase();
     const engineParam = (url.searchParams.get('engine') || '').toLowerCase();
-    // [Optimization] For non-browser agents (like subconverters), default to 'builtin' engine 
-    // to avoid redirection loops and provide a cleaner data source URL.
-    const defaultEngineMode = isBrowser ? (profileSub.engineMode || globalSub.engineMode || 'builtin') : 'builtin';
+    // [Optimization] Respect user defined engine mode while preventing loops for non-browser agents (backend fetchers)
+    const defaultEngineMode = profileSub.engineMode || globalSub.engineMode || 'builtin';
     
     const effectiveEngine = engineParam || (builtinParam === 'external' ? 'external' : (builtinParam === 'true' ? 'builtin' : '')) || defaultEngineMode;
     const isExternalMode = effectiveEngine === 'external';
@@ -513,9 +527,11 @@ export async function handleMisubRequest(context) {
         const dataSourceUrl = new URL(request.url);
         
         // [加固] 彻底清理 URL 参数，防止参数污染导致后端返回 400 错误
-        // [优化] 不再强制注入 target=nodes 和 engine=builtin，因为非浏览器请求已默认使用内置引擎
+        // [优化] 不再强制注入 target=nodes，因为非浏览器请求已默认使用内置引擎
+        // [关键] 显式注入 builtin=true 确保后端拉取数据时强制走内置逻辑，打破重定向环
         const paramsToClear = ['target', 'engine', 'builtin', 'clash', 'singbox', 'surge', 'loon', 'quanx', 'egern', 'base64', 'v2ray', 'trojan', 'list', 'include', 'exclude'];
         paramsToClear.forEach(p => dataSourceUrl.searchParams.delete(p));
+        dataSourceUrl.searchParams.set('builtin', 'true');
 
         // [关键修复] 确保后端拉取数据时包含身份令牌
         // 只有当 URL 路径中不包含令牌时，才在查询参数中显式注入
@@ -546,13 +562,29 @@ export async function handleMisubRequest(context) {
         });
 
         // Pass Remote Config if applicable
-        if (templateUrl && templateSource.kind === 'remote') {
-            // [回滚] 恢复使用 URL 传递配置。虽然 Base64 更可靠，但并非所有后端都支持 base64: 前缀
-            externalUrl.searchParams.set('config', templateSource.value);
+        const externalTemplateConfigUrl = resolveExternalTemplateConfigUrl(templateSource);
+        if (externalTemplateConfigUrl) {
+            externalUrl.searchParams.set('config', externalTemplateConfigUrl);
         }
 
         // Add File Name
         externalUrl.searchParams.set('filename', subName);
+
+        // [Access Log] Send notification for external redirection
+        if (!url.searchParams.has('callback_token') && !shouldSkipLogging && config.enableAccessLog) {
+            const clientIp = request.headers.get('CF-Connecting-IP')
+                || request.headers.get('X-Real-IP')
+                || request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim()
+                || 'N/A';
+            context.waitUntil(
+                sendEnhancedTgNotification(
+                    config,
+                    '🛰️ <b>订阅被访问</b> (第三方转换)',
+                    clientIp,
+                    `<b>域名:</b> <code>${tgEscape(domain)}</code>\n<b>客户端:</b> <code>${tgEscape(userAgentHeader)}</code>\n<b>请求格式:</b> <code>${tgEscape(targetFormat)}</code>\n<b>订阅组:</b> <code>${tgEscape(subName)}</code>`
+                )
+            );
+        }
 
         // [重要修复] 使用手动构建出的 302 响应，以确保头部是可变的 (Mutable)
         return new Response(null, {
@@ -560,7 +592,8 @@ export async function handleMisubRequest(context) {
             headers: {
                 'Location': externalUrl.toString(),
                 'Cache-Control': 'no-store, no-cache',
-                'X-MiSub-Mode': 'external-redirect-v2'
+                'X-MiSub-Mode': 'external-redirect-v2',
+                ...(templateSource.kind === 'builtin' ? { 'X-MiSub-Template-Warning': 'external-engine-ignores-builtin-template' } : {})
             }
         });
     }
@@ -655,8 +688,15 @@ export async function handleMisubRequest(context) {
                 return acc;
             }, { upload: 0, download: 0, total: 0, expire: 0 });
 
-            const userInfoHeader = totalUserInfo.total > 0 
-                ? `upload=${totalUserInfo.upload}; download=${totalUserInfo.download}; total=${totalUserInfo.total}; expire=${totalUserInfo.expire}`
+            const safeUserInfo = {
+                upload: isFinite(totalUserInfo.upload) ? totalUserInfo.upload : 0,
+                download: isFinite(totalUserInfo.download) ? totalUserInfo.download : 0,
+                total: isFinite(totalUserInfo.total) ? totalUserInfo.total : 0,
+                expire: isFinite(totalUserInfo.expire) ? totalUserInfo.expire : 0
+            };
+
+            const userInfoHeader = safeUserInfo.total > 0 
+                ? `upload=${safeUserInfo.upload}; download=${safeUserInfo.download}; total=${safeUserInfo.total}; expire=${safeUserInfo.expire}`
                 : null;
 
             let { content: finalContent, contentType, headers: resultHeaders } = await ProcessorService.renderOutput({
@@ -681,9 +721,15 @@ export async function handleMisubRequest(context) {
             }
 
             const isJson = targetFormat === 'singbox' || targetFormat === 'sing-box';
+            
+            // [RFC 6266 / RFC 5987] Standardized Content-Disposition
+            // filename: ASCII-only fallback, filename*: UTF-8 encoded
+            const asciiSubName = subName.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
+            const encodedSubName = encodeURIComponent(subName).replace(/'/g, "%27").replace(/\(/g, "%28").replace(/\)/g, "%29").replace(/\*/g, "%2A");
+            
             const responseHeaders = new Headers({
-                "Content-Disposition": `attachment; filename="${encodeURIComponent(subName)}"; filename*=utf-8''${encodeURIComponent(subName)}`,
-                'Content-Type': contentType,
+                "Content-Disposition": `attachment; filename="${asciiSubName}"; filename*=utf-8''${encodedSubName}`,
+                'Content-Type': contentType || 'text/plain; charset=utf-8',
                 'Cache-Control': 'no-store, no-cache',
                 'X-MiSub-Mode': `builtin-${targetFormat}`,
                 'Access-Control-Allow-Origin': '*'
@@ -726,7 +772,7 @@ export async function handleMisubRequest(context) {
                 }
             }
 
-            return new Response(finalContent, { headers: responseHeaders });
+            return new Response(finalContent || '', { headers: responseHeaders });
 
         } catch (e) {
             console.error(`[Builtin${targetFormat}] Generation failed:`, e);
