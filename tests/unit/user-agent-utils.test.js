@@ -73,6 +73,13 @@ describe('User-Agent Utils', () => {
             expect(determineTargetFormat('Loon/2.1', params)).toBe('loon');
         });
 
+        it('should default Shadowrocket adaptive subscription links to base64 unless explicitly overridden', () => {
+            expect(determineTargetFormat('Shadowrocket/2.2.60 CFNetwork/1496.0.7 Darwin/23.5.0', new URLSearchParams(''))).toBe('base64');
+            expect(determineTargetFormat('shadowrocket', new URLSearchParams(''))).toBe('base64');
+            expect(determineTargetFormat('Shadowrocket/2.2.60', new URLSearchParams('?clash=1'))).toBe('clash');
+            expect(determineTargetFormat('Shadowrocket/2.2.60', new URLSearchParams('?target=surge&ver=4'))).toBe('surge&ver=4');
+        });
+
         it('should treat Yuetu Android clients as Clash-compatible', () => {
             const params = new URLSearchParams('');
             expect(determineTargetFormat('月兔/v2.0.9 Platform/android', params)).toBe('clash');

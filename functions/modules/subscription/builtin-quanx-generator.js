@@ -77,10 +77,9 @@ function buildQxLine(proxy) {
             extraParts.push(`obfs=${proxy.obfs || opts.mode}`);
             if (proxy['obfs-host'] || opts.host) extraParts.push(`obfs-host=${proxy['obfs-host'] || opts.host}`);
         } else if (plugin === 'v2ray-plugin' || opts.mode === 'websocket') {
-            extraParts.push('obfs=ws');
+            extraParts.push((opts.tls || opts.mode === 'websocket-tls') ? 'obfs=wss' : 'obfs=ws');
             if (opts.path) extraParts.push(`obfs-uri=${opts.path}`);
             if (opts.host) extraParts.push(`obfs-host=${opts.host}`);
-            if (opts.tls || opts.mode === 'websocket-tls') extraParts.push('over-tls=true');
         }
 
         if (proxy.udp) extraParts.push('udp-relay=true');
@@ -166,6 +165,7 @@ function buildQxLine(proxy) {
             if (realityOpts['short-id']) extraParts.push(`reality-hex-shortid=${realityOpts['short-id']}`);
         }
 
+        if (proxy.flow) extraParts.push(`vless-flow=${proxy.flow}`);
         appendQxTlsParams(extraParts, proxy);
         return `vless=${server}:${port}, password=${uuid}${extraParts.length > 0 ? `, ${extraParts.join(', ')}` : ''}, tag=${name}`;
     }
@@ -204,13 +204,28 @@ function buildQxLine(proxy) {
 
     if (type === 'anytls') {
         const extraParts = [`password=${proxy.password || ''}`];
-        if (proxy.sni || proxy.servername) extraParts.push(`sni=${proxy.sni || proxy.servername}`);
-        if (proxy.alpn) {
-            const alpn = Array.isArray(proxy.alpn) ? proxy.alpn.join(',') : proxy.alpn;
-            extraParts.push(`alpn=${alpn}`);
+        extraParts.push('over-tls=true');
+        
+        if (proxy['skip-cert-verify'] === true || proxy.skipCertVerify === true) {
+            extraParts.push('tls-verification=false');
+        } else {
+            extraParts.push('tls-verification=true');
         }
-        appendQxTlsParams(extraParts, proxy);
-        return `anytls=${server}:${port}, ${extraParts.join(', ')}${proxy.tfo ? ', fast-open=true' : ''}, tag=${name}`;
+
+        if (proxy.sni || proxy.servername) {
+            extraParts.push(`tls-host=${proxy.sni || proxy.servername}`);
+        }
+
+        if (proxy.security === 'reality' || proxy['reality-opts']) {
+            const realityOpts = proxy['reality-opts'] || {};
+            if (realityOpts['public-key']) extraParts.push(`reality-base64-pubkey=${realityOpts['public-key']}`);
+            if (realityOpts['short-id']) extraParts.push(`reality-hex-shortid=${realityOpts['short-id']}`);
+        }
+
+        extraParts.push(`fast-open=${proxy.tfo ? 'true' : 'false'}`);
+        extraParts.push(`udp-relay=${proxy.udp ? 'true' : 'false'}`);
+
+        return `anytls=${server}:${port}, ${extraParts.join(', ')}, tag=${name}`;
     }
 
     return null;

@@ -106,6 +106,8 @@ export function determineTargetFormat(userAgent, searchParams) {
         ['sing-box', 'singbox'],
         ['singbox', 'singbox'],
         ['hiddify', 'clash'],
+        // Shadowrocket / 小火箭 prefers raw base64 subscription content for adaptive links.
+        // Explicit URL params such as ?clash=1 or ?target=surge still override this mapping.
         ['shadowrocket', 'base64'],
         ['v2rayn', 'base64'],
         ['v2rayng', 'base64'],

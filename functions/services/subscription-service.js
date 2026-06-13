@@ -10,6 +10,7 @@ import { buildFetchProxyUrl } from '../utils/fetch-proxy-utils.js';
 import { prependNodeName, addFlagEmoji, removeFlagEmoji, fixNodeUrlEncoding, sanitizeNodeForYaml } from '../utils/node-utils.js';
 import { runOperatorChain } from '../utils/operator-runner.js';
 import { createTimeoutFetch } from '../modules/utils.js';
+import { assertPublicNetworkUrl } from '../modules/security-utils.js';
 
 /**
  * 订阅获取配置常量
@@ -45,6 +46,21 @@ export function isRealProxyNode(node) {
     const trimmed = node.trim().toLowerCase();
     if (!trimmed) return false;
     return REAL_PROXY_PROTOCOLS.some(protocol => trimmed.startsWith(protocol));
+}
+
+export function parseSubscriptionUserInfoHeader(header) {
+    if (typeof header !== 'string' || !header.trim()) return null;
+
+    const info = {};
+    header.split(';').forEach(part => {
+        const [rawKey, rawValue] = part.trim().split('=');
+        const key = rawKey?.trim();
+        const value = rawValue?.trim();
+        if (!key || value === undefined || value === '') return;
+        info[key] = /^\d+$/.test(value) ? Number(value) : value;
+    });
+
+    return Object.keys(info).length > 0 ? info : null;
 }
 
 /**
@@ -94,6 +110,66 @@ async function writeSubscriptionNodeCache(storage, sub, nodes) {
         console.warn('[SubscriptionCache] Failed to write cache:', error);
         return false;
     }
+}
+
+async function writeSubscriptionRuntimeInfo(storage, sub, runtimeInfo = {}) {
+    if (!storage || !sub?.id) return false;
+    const { nodeCount, userInfo } = runtimeInfo;
+    const hasUserInfo = Object.prototype.hasOwnProperty.call(runtimeInfo, 'userInfo');
+
+    try {
+        const applyUpdate = current => {
+            if (!current) return current;
+            return {
+                ...current,
+                nodeCount: Number.isFinite(nodeCount) ? nodeCount : current.nodeCount,
+                ...(hasUserInfo ? { userInfo } : {}),
+                lastError: null,
+                lastUpdate: new Date().toISOString()
+            };
+        };
+
+        if (typeof storage.updateSubscriptionById === 'function') {
+            return Boolean(await storage.updateSubscriptionById(sub.id, applyUpdate));
+        }
+
+        if (typeof storage.get === 'function' && typeof storage.put === 'function') {
+            const all = await storage.get('misub_subscriptions_v1');
+            if (!Array.isArray(all)) return false;
+            const index = all.findIndex(item => item?.id === sub.id);
+            if (index === -1) return false;
+            all[index] = applyUpdate(all[index]);
+            await storage.put('misub_subscriptions_v1', all);
+            return true;
+        }
+    } catch (error) {
+        console.warn('[SubscriptionRuntimeInfo] Failed to write subscription info:', error);
+    }
+
+    return false;
+}
+
+function scheduleSubscriptionRuntimeInfoUpdate(context, storage, sub, runtimeInfo) {
+    const promise = writeSubscriptionRuntimeInfo(storage, sub, runtimeInfo);
+
+    if (context && typeof context.waitUntil === 'function') {
+        context.waitUntil(promise.catch(error => {
+            console.warn('[SubscriptionRuntimeInfo] Async update failed:', error);
+        }));
+        return;
+    }
+
+    promise.catch(error => {
+        console.warn('[SubscriptionRuntimeInfo] Async update failed:', error);
+    });
+}
+
+function recordCurrentRequestRuntimeInfo(context, sub, runtimeInfo) {
+    const key = sub?.id || sub?.url;
+    if (!context || !key) return;
+
+    context.currentSubscriptionRuntimeInfo = context.currentSubscriptionRuntimeInfo || {};
+    context.currentSubscriptionRuntimeInfo[key] = runtimeInfo;
 }
 
 /**
@@ -327,6 +403,7 @@ const prependGroupName = profilePrefixSettings?.prependGroupName ?? false;
 
     const httpSubs = misubs.filter(sub => sub && sub.url && sub.url.toLowerCase().startsWith('http'));
     const limiter = createConcurrencyLimiter(FETCH_CONFIG.CONCURRENCY);
+    let upstreamSuccessCount = 0; // 追踪真正从远程拉取成功的订阅数（不含 per-sub 缓存回退）
 
     /**
      * 获取单个订阅内容
@@ -336,6 +413,15 @@ const prependGroupName = profilePrefixSettings?.prependGroupName ?? false;
     const fetchSingleSubscription = async (sub) => {
         const cacheEnabled = sub?.enableNodeCache === true;
         const storage = context?.storage;
+        const recordEmptyRuntimeInfo = () => {
+            if (cacheEnabled) return;
+            const runtimeInfo = {
+                nodeCount: 0,
+                userInfo: null
+            };
+            recordCurrentRequestRuntimeInfo(context, sub, runtimeInfo);
+            scheduleSubscriptionRuntimeInfoUpdate(context, storage, sub, runtimeInfo);
+        };
         const readCachedNodes = async () => {
             if (!cacheEnabled) return [];
             const cached = await readSubscriptionNodeCache(storage, sub);
@@ -348,10 +434,12 @@ const prependGroupName = profilePrefixSettings?.prependGroupName ?? false;
             const requestHeaders = { 'User-Agent': processedUserAgent };
 
             // [Fetch Proxy] 获取单点订阅专属拉取代理前缀
+            assertPublicNetworkUrl(sub.url);
             let requestUrl = sub.url;
             if (sub.fetchProxy && typeof sub.fetchProxy === 'string' && sub.fetchProxy.trim()) {
                 requestUrl = buildFetchProxyUrl(sub.fetchProxy, sub.url, processedUserAgent);
             }
+            requestUrl = assertPublicNetworkUrl(requestUrl).toString();
 
             const response = await fetchWithRetry(requestUrl, {
                 headers: requestHeaders,
@@ -366,6 +454,7 @@ const prependGroupName = profilePrefixSettings?.prependGroupName ?? false;
             });
 
             if (!response.ok) {
+                recordEmptyRuntimeInfo();
                 return (await readCachedNodes()).join('\n');
             }
             const buffer = await response.arrayBuffer();
@@ -394,9 +483,23 @@ const prependGroupName = profilePrefixSettings?.prependGroupName ?? false;
             if (cacheEnabled && realNodes.length === 0) {
                 return (await readCachedNodes()).join('\n');
             }
+            if (!cacheEnabled && realNodes.length === 0) {
+                recordEmptyRuntimeInfo();
+            }
 
             if (cacheEnabled) {
                 await writeSubscriptionNodeCache(storage, sub, realNodes);
+            }
+
+            if (realNodes.length > 0) {
+                upstreamSuccessCount++;
+                const userInfo = parseSubscriptionUserInfoHeader(response.headers.get('subscription-userinfo'));
+                const runtimeInfo = {
+                    nodeCount: realNodes.length,
+                    userInfo
+                };
+                recordCurrentRequestRuntimeInfo(context, sub, runtimeInfo);
+                scheduleSubscriptionRuntimeInfoUpdate(context, storage, sub, runtimeInfo);
             }
 
             // 判断是否启用订阅前缀（智能重命名启用时跳过）
@@ -407,6 +510,7 @@ const prependGroupName = profilePrefixSettings?.prependGroupName ?? false;
                 ? validNodes.map(node => prependNodeName(node, sub.name)).join('\n')
                 : validNodes.join('\n');
         } catch (e) {
+            recordEmptyRuntimeInfo();
             return (await readCachedNodes()).join('\n');
         }
     };
@@ -499,6 +603,7 @@ const prependGroupName = profilePrefixSettings?.prependGroupName ?? false;
                 sourceCount: httpSubs.length,
                 successCount,
                 failCount,
+                upstreamSuccessCount,
                 duration: endTime - (context.startTime || Date.now())
             };
         }

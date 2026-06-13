@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const getAllSubscriptions = vi.fn();
 const getAllProfiles = vi.fn();
@@ -11,6 +11,7 @@ const deleteProfileById = vi.fn();
 const createAdapter = vi.fn();
 const getStorageType = vi.fn();
 const settingsCacheGet = vi.fn();
+const clearAllNodeCaches = vi.fn();
 
 vi.mock('../../functions/storage-adapter.js', () => ({
   StorageFactory: {
@@ -51,11 +52,15 @@ vi.mock('../../functions/modules/notifications.js', () => ({
 }));
 
 vi.mock('../../functions/services/node-cache-service.js', () => ({
-  clearAllNodeCaches: vi.fn().mockResolvedValue({ cleared: 0 })
+  clearAllNodeCaches: (...args) => clearAllNodeCaches(...args)
 }));
 
 describe('api-handler storage helper usage', () => {
+  let infoSpy;
+
   beforeEach(() => {
+    infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
+
     getAllSubscriptions.mockReset();
     getAllProfiles.mockReset();
     get.mockReset();
@@ -67,9 +72,11 @@ describe('api-handler storage helper usage', () => {
     createAdapter.mockReset();
     getStorageType.mockReset();
     settingsCacheGet.mockReset();
+    clearAllNodeCaches.mockReset();
 
     getStorageType.mockResolvedValue('d1');
     settingsCacheGet.mockResolvedValue({});
+    clearAllNodeCaches.mockResolvedValue({ cleared: 0, failed: 0, skipped: 0 });
     createAdapter.mockReturnValue({
       getAllSubscriptions,
       getAllProfiles,
@@ -85,6 +92,10 @@ describe('api-handler storage helper usage', () => {
     putProfile.mockResolvedValue(true);
     deleteSubscriptionById.mockResolvedValue(true);
     deleteProfileById.mockResolvedValue(true);
+  });
+
+  afterEach(() => {
+    infoSpy.mockRestore();
   });
 
   it('handleDataRequest prefers getAll helper APIs', async () => {
@@ -126,6 +137,38 @@ describe('api-handler storage helper usage', () => {
     expect(response.status).toBe(200);
     expect(getAllSubscriptions).toHaveBeenCalled();
     expect(getAllProfiles).toHaveBeenCalled();
+    expect(infoSpy).toHaveBeenCalledWith('[API] Processing Diff Patch...');
+    expect(infoSpy).toHaveBeenCalledWith('[API] Cleared 0 node caches after subscription update, preserved 0');
+  });
+
+  it('handleMisubsSave preserves protective caches only for subscriptions with node cache enabled', async () => {
+    const { handleMisubsSave } = await import('../../functions/modules/api-handler.js');
+
+    getAllSubscriptions.mockResolvedValue([]);
+    getAllProfiles.mockResolvedValue([]);
+    get.mockResolvedValue({});
+    put.mockResolvedValue(true);
+
+    const request = {
+      async json() {
+        return {
+          misubs: [
+            { id: 'sub-enabled', name: 'Enabled', url: 'https://a.example.com', enableNodeCache: true },
+            { id: 'sub-disabled', name: 'Disabled', url: 'https://b.example.com', enableNodeCache: false }
+          ],
+          profiles: []
+        };
+      }
+    };
+
+    const response = await handleMisubsSave(request, { MISUB_DB: {} });
+
+    expect(response.status).toBe(200);
+    expect(clearAllNodeCaches).toHaveBeenCalledWith(
+      expect.any(Object),
+      { preserveKeys: ['node_cache_subscription_sub-enabled'] }
+    );
+    expect(infoSpy).toHaveBeenCalledWith('[API] Cleared 0 node caches after subscription update, preserved 0');
   });
 
   it('handleMisubsSave uses row-level helpers for simple diffs', async () => {
@@ -160,6 +203,8 @@ describe('api-handler storage helper usage', () => {
     expect(deleteProfileById).toHaveBeenCalledWith('profile-2');
     expect(put).not.toHaveBeenCalledWith('misub_subscriptions_v1', expect.anything());
     expect(put).not.toHaveBeenCalledWith('misub_profiles_v1', expect.anything());
+    expect(infoSpy).toHaveBeenCalledWith('[API] Processing Diff Patch...');
+    expect(infoSpy).toHaveBeenCalledWith('[API] Cleared 0 node caches after subscription update, preserved 0');
   });
 
   it('handleMisubsSave full save uses row-level sync when helper APIs are available', async () => {
@@ -201,5 +246,6 @@ describe('api-handler storage helper usage', () => {
     expect(deleteProfileById).toHaveBeenCalledWith('profile-legacy');
     expect(put).not.toHaveBeenCalledWith('misub_subscriptions_v1', expect.anything());
     expect(put).not.toHaveBeenCalledWith('misub_profiles_v1', expect.anything());
+    expect(infoSpy).toHaveBeenCalledWith('[API] Cleared 0 node caches after subscription update, preserved 0');
   });
 });
